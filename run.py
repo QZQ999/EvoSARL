@@ -53,6 +53,17 @@ def run(_run, _config, _log):
     # sacred is on by default
     logger.setup_sacred(_run)
 
+    # configure wandb logger
+    if getattr(args, 'use_wandb', False) and not args.evaluate:
+        # only log wandb when in training mode
+        wandb_project = getattr(args, 'wandb_project', 'EvoSARL')
+        wandb_name = getattr(args, 'wandb_name', args.unique_token)
+        logger.setup_wandb(
+            project_name=wandb_project,
+            name=wandb_name,
+            config=vars(args)
+        )
+
     # Run and train
     run_sequential(args=args, logger=logger)
 
