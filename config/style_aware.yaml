@@ -1,0 +1,114 @@
+# --- Style-Aware Adaptive Teammate Generation Configuration ---
+
+# Inherit from default config
+defaults:
+  - default
+
+# --- Algorithm Selection ---
+runner: "episode_xp" # Use cross-play runner
+mac: "basic_mac"
+env: "sc2"
+env_args: {}
+
+# --- Training Hyperparameters ---
+batch_size_run: 1
+batch_size: 32
+buffer_size: 32
+test_nepisode: 32
+test_interval: 10000
+log_interval: 2000
+
+# --- Style Embedding (Phase 1) ---
+style_embedding_dim: 64 # Dimension of style embedding space
+style_encoder_hidden_dim: 128 # Hidden dimension for style encoder
+style_encoder_lr: 0.001 # Learning rate for contrastive learning
+contrastive_temperature: 0.07 # Temperature for InfoNCE loss
+n_contrastive_epochs: 50 # Number of epochs to train φ
+n_pretrain_episodes: 1000 # Episodes to collect for training φ
+batch_size_contrastive: 32 # Batch size for contrastive learning
+
+# --- Prototype Space (Phase 1 & 2) ---
+n_initial_prototypes: 10 # K_0, initial number of prototypes
+population_size_per_prototype: 3 # n_k, teammates per prototype
+proto_elimination_threshold: 0.0 # θ_elim for removing weak prototypes
+proto_merging_threshold: 0.9 # θ_merge for merging similar prototypes
+proto_eval_window: 5 # W, evaluation window for prototype management
+proto_management_window: 5 # Perform elimination/merging every W generations
+
+# --- Teammate Evolution (Phase 2) ---
+max_generations: 20 # G_max, number of evolutionary generations
+t_train_tm_per_generation: 10000 # Training steps per generation
+learner_tm: "q_learner_tm" # Teammate learner
+
+# Reward Shaping
+alpha_style_control: 1.0 # Weight for r_ref (style control reward)
+alpha_exploration: 0.1 # Weight for r_explore (k-NN novelty reward)
+knn_k: 5 # k for k-NN exploration reward
+
+# Loss Components
+xp_coef: 1.0 # Weight for cross-play loss L_XP
+diversity_coef: 0.5 # γ, weight for diversity loss L_div
+
+# --- Ego Training (Phase 3) ---
+learner: "q_learner_ego" # Ego learner
+t_train_ego_per_head: 50000 # Training steps per head
+alpha_regularization: 0.01 # α_reg, regularization weight for preventing forgetting
+
+# --- RL Hyperparameters ---
+gamma: 0.99
+lr: 0.0005
+critic_lr: 0.0005
+optim_type: "Adam"
+grad_norm_clip: 10
+weight_decay: 0
+
+# --- Agent Architecture ---
+agent: "rnn"
+rnn_hidden_dim: 64
+obs_agent_id: True
+obs_last_action: True
+
+# --- Value Mixing ---
+mixer: "qmix" # or "vdn"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+# --- Exploration ---
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+# --- Target Network ---
+target_update_interval: 200
+double_q: True
+
+# --- Standardization ---
+standardise_returns: False
+standardise_rewards: False
+
+# --- Logging ---
+use_tensorboard: True
+use_wandb: True
+wandb_project: "EvoSARL-StyleAware"
+wandb_run_name: null
+wandb_tags: ["style-aware", "prototype-space"]
+wandb_notes: "Style-aware adaptive teammate generation with prototype space"
+
+save_model: True
+save_model_interval: 100000
+checkpoint_path: ""
+evaluate: False
+load_step: 0
+save_replay: False
+local_results_path: "results_style_aware"
+
+# --- Experiment Settings ---
+repeat_id: 1
+label: "style_aware"
+seed: 0
+use_cuda: True
+buffer_cpu_only: True
+
+# --- Iteration Control ---
+t_max: 2000000 # Total timesteps
