@@ -18,6 +18,11 @@ buffer_cpu_only: True # If true we won't keep all of the replay buffer in vram
 
 # --- Logging options ---
 use_tensorboard: True # Log results to tensorboard
+use_wandb: True # Log results to Weights & Biases
+wandb_project: "EvoSARL" # Wandb project name
+wandb_run_name: null # Wandb run name (if null, wandb will auto-generate)
+wandb_tags: null # Wandb tags (list of strings, e.g., ["exp1", "baseline"])
+wandb_notes: null # Wandb notes (string description of the run)
 save_model: True # Save the models to disk
 save_model_interval: 2000000 # Save models after this many timesteps
 checkpoint_path: "" # Load a checkpoint from this path

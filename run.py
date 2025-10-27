@@ -11,6 +11,14 @@ from os.path import dirname, abspath
 from copy import deepcopy
 import h5py
 
+# Import wandb with graceful fallback
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Install with 'pip install wandb' to enable wandb logging.")
+
 from learners import REGISTRY as le_REGISTRY
 from runners import REGISTRY as r_REGISTRY
 from controllers import REGISTRY as mac_REGISTRY
@@ -52,6 +60,27 @@ def run(_run, _config, _log):
 
     # sacred is on by default
     logger.setup_sacred(_run)
+
+    # configure wandb logger
+    if args.use_wandb and not args.evaluate:
+        if not WANDB_AVAILABLE:
+            _log.warning("Wandb is not installed. Skipping wandb logging. Install with 'pip install wandb'.")
+        else:
+            # only log wandb when in training mode
+            try:
+                wandb_run = wandb.init(
+                    project=args.wandb_project,
+                    name=args.wandb_run_name if hasattr(args, 'wandb_run_name') and args.wandb_run_name else None,
+                    config=vars(args),
+                    tags=args.wandb_tags if hasattr(args, 'wandb_tags') and args.wandb_tags else None,
+                    notes=args.wandb_notes if hasattr(args, 'wandb_notes') and args.wandb_notes else None,
+                    dir=results_save_dir,
+                    reinit=True
+                )
+                logger.setup_wandb(wandb_run)
+                _log.info(f"Wandb initialized successfully. Project: {args.wandb_project}, Run: {wandb_run.name}")
+            except Exception as e:
+                _log.warning(f"Failed to initialize wandb: {e}. Continuing without wandb logging.")
 
     # Run and train
     run_sequential(args=args, logger=logger)
