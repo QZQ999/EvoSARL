@@ -61,3 +61,22 @@ standardise_rewards: False
 max_iteration: 10
 selfplay_threshold: 0.8
 stop_threshold: 0.5
+
+# --- Style-Aware Training (Optional) ---
+use_style_aware: False # Enable style-aware adaptive teammate generation
+style_embedding_dim: 64
+n_initial_prototypes: 10
+n_pretrain_episodes: 100
+population_size_per_prototype: 3
+style_encoder_hidden_dim: 128
+style_encoder_lr: 0.001
+contrastive_temperature: 0.07
+n_contrastive_epochs: 50
+batch_size_contrastive: 32
+alpha_style_control: 1.0
+alpha_exploration: 0.1
+proto_elimination_threshold: 0.0
+proto_merging_threshold: 0.9
+proto_eval_window: 5
+proto_management_window: 5
+alpha_regularization: 0.01
