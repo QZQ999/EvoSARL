@@ -343,6 +343,9 @@ def run_sequential(args, logger):
         ## evolve teammates
         start_time = time.time()
         last_time = start_time
+
+        # Track which prototypes have logged the fallback message (to avoid spam)
+        logged_fallback_prototypes = set()
         if iter == 0 or getattr(args, "t_train_tm_after", -1)==-1:
             iter_t_train_tm = args.t_train_tm
         else:
@@ -374,6 +377,14 @@ def run_sequential(args, logger):
 
                 # Get reference embedding for reward shaping
                 z_ref = prototype_manager.get_reference_embedding(proto_id_train)
+
+                # Fallback: use prototype vector if no reference exists yet (first generation)
+                if z_ref is None:
+                    z_ref = prototype_manager.prototypes[proto_id_train]
+                    # Log only once per prototype per iteration to avoid spam
+                    if proto_id_train not in logged_fallback_prototypes:
+                        logger.console_logger.info(f"Iter {iter}: Using prototype vector as z_ref for proto {proto_id_train} (no reference policy yet)")
+                        logged_fallback_prototypes.add(proto_id_train)
             else:
                 # Original: flat population selection
                 proto_id_train = 0
