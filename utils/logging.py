@@ -9,6 +9,7 @@ class Logger:
         self.use_tb = False
         self.use_sacred = False
         self.use_hdf = False
+        self.use_wandb = False
 
         self.stats = defaultdict(lambda: [])
 
@@ -22,6 +23,13 @@ class Logger:
     def setup_sacred(self, sacred_run_dict):
         self.sacred_info = sacred_run_dict.info
         self.use_sacred = True
+
+    def setup_wandb(self, wandb_run):
+        # Import here so it doesn't have to be installed if you don't use it
+        import wandb
+        self.wandb = wandb
+        self.wandb_run = wandb_run
+        self.use_wandb = True
 
     def log_stat(self, key, value, t, to_sacred=True):
         self.stats[key].append((t, value))
@@ -37,21 +45,41 @@ class Logger:
                 self.sacred_info["{}_T".format(key)] = [t]
                 self.sacred_info[key] = [value]
 
+        if self.use_wandb:
+            # Log to wandb with timestep as the x-axis
+            self.wandb.log({key: value, "timestep": t}, step=t)
+
     def print_recent_stats(self):
         log_str = "Recent Stats | t_env: {:>10} | Episode: {:>8}\n".format(*self.stats["episode"][-1])
         i = 0
+
+        # Prepare wandb summary dict
+        wandb_summary = {}
+        t_env = self.stats["episode"][-1][0]  # Get current timestep
+
         for (k, v) in sorted(self.stats.items()):
             if k == "episode":
                 continue
             i += 1
             window = 5 if k != "epsilon" else 1
             try:
-                item = "{:.4f}".format(np.mean([x[1] for x in self.stats[k][-window:]]))
+                mean_value = np.mean([x[1] for x in self.stats[k][-window:]])
+                item = "{:.4f}".format(mean_value)
             except:
-                item = "{:.4f}".format(np.mean([x[1].item() for x in self.stats[k][-window:]]))
+                mean_value = np.mean([x[1].item() for x in self.stats[k][-window:]])
+                item = "{:.4f}".format(mean_value)
+
             log_str += "{:<25}{:>8}".format(k + ":", item)
             log_str += "\n" if i % 4 == 0 else "\t"
+
+            # Collect for wandb logging with "_mean" suffix to distinguish from raw values
+            wandb_summary[f"{k}_mean"] = float(mean_value)
+
         self.console_logger.info(log_str)
+
+        # Log the summary stats to wandb
+        if self.use_wandb and wandb_summary:
+            self.wandb.log(wandb_summary, step=t_env)
 
 
 # set up a custom logger

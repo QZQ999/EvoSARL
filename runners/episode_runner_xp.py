@@ -47,8 +47,8 @@ class EpisodeRunnerXP:
         self.env.reset()
         self.t = 0
 
-    def run(self, mac1=None, mac2=None, test_mode=False, test_mode_1=False, test_mode_2=False, 
-            negative_reward=False, tm_id=None, iter=None, eps_greedy_t=0, head_id=None, few_shot=False, lipo_xptm_id=None):
+    def run(self, mac1=None, mac2=None, test_mode=False, test_mode_1=False, test_mode_2=False,
+            negative_reward=False, tm_id=None, proto_id=None, iter=None, eps_greedy_t=0, head_id=None, few_shot=False, lipo_xptm_id=None):
 
         self.reset()
 
@@ -114,16 +114,38 @@ class EpisodeRunnerXP:
         
         cur_stats = self.test_stats if test_mode else self.train_stats
         cur_returns = self.test_returns if test_mode else self.train_returns
+
+        # Construct log prefix with prototype and individual information
         if mac2 is None:
-            if tm_id >= 0: # teammate selfplay
-                log_prefix = f"test_tm_{tm_id}_" if test_mode else f"tm_{tm_id}_"
-            elif tm_id == -1: # ego selfplay
+            # Self-play mode
+            if tm_id == -1:
+                # Ego self-play
                 log_prefix = f"test_ego_" if test_mode else f"ego_"
+            elif proto_id is not None:
+                # Style-aware: teammate self-play with prototype
+                log_prefix = f"test_sp_proto_{proto_id}_ind_{tm_id}_" if test_mode else f"sp_proto_{proto_id}_ind_{tm_id}_"
+            elif tm_id is not None and tm_id >= 0:
+                # Non-style-aware: teammate self-play
+                log_prefix = f"test_sp_tm_{tm_id}_" if test_mode else f"sp_tm_{tm_id}_"
+            else:
+                log_prefix = f"test_" if test_mode else ""
         else:
-            assert iter is not None
-            log_prefix = f"test_xp_{iter}_{tm_id}_" if test_mode else f"xp_{iter}_{tm_id}_"
+            # Cross-play mode
             if lipo_xptm_id is not None:
-                log_prefix = f"test_xp_{tm_id}_{lipo_xptm_id}_" if test_mode else f"xp_{tm_id}_{lipo_xptm_id}_"
+                # LIPO cross-play
+                log_prefix = f"test_xp_tm_{tm_id}_lipo_{lipo_xptm_id}_" if test_mode else f"xp_tm_{tm_id}_lipo_{lipo_xptm_id}_"
+            elif proto_id is not None:
+                # Style-aware cross-play with prototype
+                if iter is not None:
+                    log_prefix = f"test_xp_gen_{iter}_proto_{proto_id}_ind_{tm_id}_" if test_mode else f"xp_gen_{iter}_proto_{proto_id}_ind_{tm_id}_"
+                else:
+                    log_prefix = f"test_xp_proto_{proto_id}_ind_{tm_id}_" if test_mode else f"xp_proto_{proto_id}_ind_{tm_id}_"
+            else:
+                # Non-style-aware cross-play
+                if iter is not None:
+                    log_prefix = f"test_xp_gen_{iter}_tm_{tm_id}_" if test_mode else f"xp_gen_{iter}_tm_{tm_id}_"
+                else:
+                    log_prefix = f"test_xp_tm_{tm_id}_" if test_mode else f"xp_tm_{tm_id}_"
         cur_stats.update({k: cur_stats.get(k, 0) + env_info.get(k, 0) for k in set(cur_stats) | set(env_info)})
         cur_stats["n_episodes"] = 1 + cur_stats.get("n_episodes", 0)
         cur_stats["ep_length"] = self.t + cur_stats.get("ep_length", 0)

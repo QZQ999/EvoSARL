@@ -11,6 +11,14 @@ from os.path import dirname, abspath
 from copy import deepcopy
 import h5py
 
+# Import wandb with graceful fallback
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Install with 'pip install wandb' to enable wandb logging.")
+
 from learners import REGISTRY as le_REGISTRY
 from runners import REGISTRY as r_REGISTRY
 from controllers import REGISTRY as mac_REGISTRY
@@ -20,6 +28,15 @@ from components.transforms import OneHot
 import json
 import numpy as np
 from collections import defaultdict
+
+# Import new modules for style-aware training
+from modules.style_encoder import StyleEncoder, ContrastiveLearner, sample_prototypes_on_sphere
+from modules.prototype_manager import PrototypeManager
+from components.reward_shaping import (
+    add_shaped_rewards_to_batch,
+    collect_trajectories_for_embedding_training,
+    compute_trajectory_style_embedding
+)
 
 def run(_run, _config, _log):
 
@@ -53,6 +70,27 @@ def run(_run, _config, _log):
     # sacred is on by default
     logger.setup_sacred(_run)
 
+    # configure wandb logger
+    if args.use_wandb and not args.evaluate:
+        if not WANDB_AVAILABLE:
+            _log.warning("Wandb is not installed. Skipping wandb logging. Install with 'pip install wandb'.")
+        else:
+            # only log wandb when in training mode
+            try:
+                wandb_run = wandb.init(
+                    project=args.wandb_project,
+                    name=args.wandb_run_name if hasattr(args, 'wandb_run_name') and args.wandb_run_name else None,
+                    config=vars(args),
+                    tags=args.wandb_tags if hasattr(args, 'wandb_tags') and args.wandb_tags else None,
+                    notes=args.wandb_notes if hasattr(args, 'wandb_notes') and args.wandb_notes else None,
+                    dir=results_save_dir,
+                    reinit=True
+                )
+                logger.setup_wandb(wandb_run)
+                _log.info(f"Wandb initialized successfully. Project: {args.wandb_project}, Run: {wandb_run.name}")
+            except Exception as e:
+                _log.warning(f"Failed to initialize wandb: {e}. Continuing without wandb logging.")
+
     # Run and train
     run_sequential(args=args, logger=logger)
 
@@ -71,14 +109,17 @@ def run(_run, _config, _log):
     # Making sure framework really exits
     os._exit(os.EX_OK)
 
-def evaluate_xp_log(args, test_tm_id:int, iter:int, iter_plus_tm_2_head_id:dict, all_head_id_list:list,
-                    runner, mac_ego, test_mac):
+def evaluate_xp_log(args, test_tm_id:int, test_proto_id, test_ind_id, iter:int, iter_plus_tm_2_head_id:dict, all_head_id_list:list,
+                    runner, mac_ego, test_mac, use_style_aware:bool):
     few_shot_info = {head_id: [] for head_id in all_head_id_list+[None]}
     for test_head_id in all_head_id_list + [None]:
-        tmp_info = runner.run(mac1=mac_ego,  mac2=test_mac, test_mode=True, test_mode_1=True, test_mode_2=True, 
-                    tm_id=test_tm_id, iter=iter, head_id=test_head_id, few_shot=True)
+        tmp_info = runner.run(
+            mac1=mac_ego, mac2=test_mac, test_mode=True, test_mode_1=True, test_mode_2=True,
+            tm_id=test_ind_id, proto_id=test_proto_id if use_style_aware else None,
+            iter=iter, head_id=test_head_id, few_shot=True
+        )
         few_shot_info[test_head_id].append(tmp_info["episode_return"])
-    best_head_id, best_ret = -1, -1e9 
+    best_head_id, best_ret = -1, -1e9
     for head_id, ret_list in few_shot_info.items():
         if len(ret_list) == 0:
             continue
@@ -87,7 +128,11 @@ def evaluate_xp_log(args, test_tm_id:int, iter:int, iter_plus_tm_2_head_id:dict,
             best_ret = ret
             best_head_id = head_id
     for _ in range(args.test_nepisode): # xp
-        runner.run(mac1=mac_ego,  mac2=test_mac, test_mode=True, test_mode_1=True, test_mode_2=True, tm_id=test_tm_id, iter=iter, head_id=best_head_id)
+        runner.run(
+            mac1=mac_ego, mac2=test_mac, test_mode=True, test_mode_1=True, test_mode_2=True,
+            tm_id=test_ind_id, proto_id=test_proto_id if use_style_aware else None,
+            iter=iter, head_id=best_head_id
+        )
 
 def run_sequential(args, logger):
 
@@ -119,16 +164,169 @@ def run_sequential(args, logger):
     if args.use_cuda:
         learner_ego.cuda()
 
-    ## init tm pop
-    tm2buffer, tm2bufferxp, tm2learner, tm2mac, iter2tm2mac4testing = {}, {}, {}, {}, {}
-    for tm_id_init in range(args.n_population):
-        mac_tm = deepcopy(mac_ego)
-        tm2buffer[tm_id_init] = deepcopy(empty_buffer)
-        tm2bufferxp[tm_id_init] = deepcopy(empty_buffer)
-        tm2learner[tm_id_init] = le_REGISTRY[args.learner_tm](mac_tm, tm2buffer[tm_id_init].scheme, logger, args, tm_index=tm_id_init)
+    ## ============================================================================
+    ## PHASE 1: Style Embedding Training (New)
+    ## ============================================================================
+
+    # Check if we should use style-aware training
+    use_style_aware = getattr(args, 'use_style_aware', False)
+
+    if use_style_aware:
+        logger.console_logger.info("="*80)
+        logger.console_logger.info("PHASE 1: Style Embedding Training")
+        logger.console_logger.info("="*80)
+
+        # Hyperparameters
+        embedding_dim = getattr(args, 'style_embedding_dim', 64)
+        n_initial_prototypes = getattr(args, 'n_initial_prototypes', args.n_population)
+        n_pretrain_episodes = getattr(args, 'n_pretrain_episodes', 100)
+        population_size_per_prototype = getattr(args, 'population_size_per_prototype', 3)
+
+        # Initialize prototype manager
+        prototype_manager = PrototypeManager(
+            n_initial_prototypes=n_initial_prototypes,
+            embedding_dim=embedding_dim,
+            population_size_per_prototype=population_size_per_prototype,
+            elimination_threshold=getattr(args, 'proto_elimination_threshold', 0.0),
+            merging_threshold=getattr(args, 'proto_merging_threshold', 0.9),
+            evaluation_window=getattr(args, 'proto_eval_window', 5)
+        )
+
+        logger.console_logger.info(f"Initialized {len(prototype_manager.get_active_prototypes())} prototypes")
+
+        # Create base teammate and collect trajectories for embedding training
+        base_mac_tm = mac_REGISTRY[args.mac](empty_buffer.scheme, groups, args)
         if args.use_cuda:
-            tm2learner[tm_id_init].cuda()
-        tm2mac[tm_id_init] = mac_tm
+            base_mac_tm.cuda()
+
+        # Initialize populations with random perturbations
+        logger.console_logger.info("Initializing teammate populations...")
+        all_init_macs = []
+        for proto_id in prototype_manager.get_active_prototypes():
+            for _ in range(population_size_per_prototype):
+                mac_tm = deepcopy(base_mac_tm)
+                # Add random noise
+                with th.no_grad():
+                    for param in mac_tm.parameters():
+                        param.add_(th.randn_like(param) * 0.01)
+                prototype_manager.add_individual(proto_id, mac_tm, performance=0.0)
+                all_init_macs.append(mac_tm)
+
+        # Collect diverse trajectories
+        logger.console_logger.info(f"Collecting {n_pretrain_episodes} episodes for contrastive learning...")
+        n_episodes_per_mac = max(1, n_pretrain_episodes // len(all_init_macs))
+        trajectories = collect_trajectories_for_embedding_training(
+            runner, all_init_macs, n_episodes=n_episodes_per_mac
+        )
+        logger.console_logger.info(f"Collected {len(trajectories)} trajectories")
+
+        # Train style encoder
+        logger.console_logger.info("Training style encoder φ...")
+        args.obs_shape = env_info["obs_shape"]
+        style_encoder = StyleEncoder(
+            state_dim=args.obs_shape,
+            action_dim=args.n_actions,
+            hidden_dim=getattr(args, 'style_encoder_hidden_dim', 128),
+            embedding_dim=embedding_dim
+        )
+
+        contrastive_learner = ContrastiveLearner(
+            encoder=style_encoder,
+            lr=getattr(args, 'style_encoder_lr', 1e-3),
+            temperature=getattr(args, 'contrastive_temperature', 0.07),
+            device=args.device
+        )
+
+        n_contrastive_epochs = getattr(args, 'n_contrastive_epochs', 50)
+        batch_size_contrastive = getattr(args, 'batch_size_contrastive', 32)
+
+        for epoch in range(n_contrastive_epochs):
+            batch_indices = np.random.choice(len(trajectories),
+                                              size=min(batch_size_contrastive, len(trajectories)),
+                                              replace=False)
+            batch_trajs = [trajectories[i] for i in batch_indices]
+            loss = contrastive_learner.train_batch(batch_trajs)
+
+            if epoch % 10 == 0:
+                logger.console_logger.info(f"Epoch {epoch}/{n_contrastive_epochs}, InfoNCE Loss: {loss:.4f}")
+
+        # Freeze encoder
+        style_encoder.eval()
+        for param in style_encoder.parameters():
+            param.requires_grad = False
+
+        logger.console_logger.info("Style encoder training complete and frozen")
+        logger.console_logger.info("PHASE 1 COMPLETE\n")
+
+    else:
+        # Original behavior: no style-aware training
+        prototype_manager = None
+        style_encoder = None
+        n_initial_prototypes = args.n_population
+        population_size_per_prototype = 1
+
+    ## ============================================================================
+    ## Initialize teammate population (Modified for prototype structure)
+    ## ============================================================================
+
+    # Changed structure: proto2tm instead of flat tm2mac
+    # proto2tm[proto_id][ind_id] = mac
+    # tm2buffer[proto_id][ind_id] = buffer
+    proto2tm = {}
+    tm2buffer, tm2bufferxp, tm2learner = {}, {}, {}
+    iter2tm2mac4testing = {}
+
+    if use_style_aware:
+        # Organize by prototypes
+        for proto_id in prototype_manager.get_active_prototypes():
+            proto2tm[proto_id] = {}
+            tm2buffer[proto_id] = {}
+            tm2bufferxp[proto_id] = {}
+            tm2learner[proto_id] = {}
+
+            pop = prototype_manager.get_population(proto_id)
+            for ind_id, ind_data in pop.items():
+                mac_tm = ind_data['mac']
+                proto2tm[proto_id][ind_id] = mac_tm
+                tm2buffer[proto_id][ind_id] = deepcopy(empty_buffer)
+                tm2bufferxp[proto_id][ind_id] = deepcopy(empty_buffer)
+
+                learner_tm = le_REGISTRY[args.learner_tm](
+                    mac_tm, tm2buffer[proto_id][ind_id].scheme, logger, args, tm_index=ind_id, proto_id=proto_id
+                )
+                if args.use_cuda:
+                    learner_tm.cuda()
+                tm2learner[proto_id][ind_id] = learner_tm
+    else:
+        # Original flat structure for backward compatibility
+        proto_id = 0  # Single "prototype" containing all teammates
+        proto2tm[proto_id] = {}
+        tm2buffer[proto_id] = {}
+        tm2bufferxp[proto_id] = {}
+        tm2learner[proto_id] = {}
+
+        for tm_id_init in range(args.n_population):
+            mac_tm = deepcopy(mac_ego)
+            proto2tm[proto_id][tm_id_init] = mac_tm
+            tm2buffer[proto_id][tm_id_init] = deepcopy(empty_buffer)
+            tm2bufferxp[proto_id][tm_id_init] = deepcopy(empty_buffer)
+
+            learner_tm = le_REGISTRY[args.learner_tm](
+                mac_tm, tm2buffer[proto_id][tm_id_init].scheme, logger, args, tm_index=tm_id_init, proto_id=None
+            )
+            if args.use_cuda:
+                learner_tm.cuda()
+            tm2learner[proto_id][tm_id_init] = learner_tm
+
+    # Create a flat view for compatibility with some original code
+    tm2mac = {}
+    tm_idx_to_proto_info = {}  # Maps flat idx -> (proto_id, ind_id)
+    idx = 0
+    for proto_id in proto2tm:
+        for ind_id in proto2tm[proto_id]:
+            tm2mac[idx] = proto2tm[proto_id][ind_id]
+            tm_idx_to_proto_info[idx] = (proto_id, ind_id)
+            idx += 1
 
     ## start running
     episode = 0
@@ -164,33 +362,131 @@ def run_sequential(args, logger):
         t_env_start = runner.t_env
         while runner.t_env - t_env_start <= iter_t_train_tm:
 
-            ## sample a tm from pop and collect sp+xp traj
-            tm_id_train = np.random.randint(args.n_population)
-            episode_batch = runner.run(mac1=tm2mac[tm_id_train], mac2=None, test_mode=False, test_mode_1=False, test_mode_2=False, tm_id=tm_id_train, eps_greedy_t=runner.t_env-t_env_start)
-            tm2buffer[tm_id_train].insert_episode_batch(episode_batch)
+            ## Sample teammate from prototype-organized population
+            if use_style_aware:
+                # Randomly select prototype
+                active_proto_ids = list(proto2tm.keys())
+                proto_id_train = np.random.choice(active_proto_ids)
+                # Randomly select individual from this prototype
+                ind_ids = list(proto2tm[proto_id_train].keys())
+                ind_id_train = np.random.choice(ind_ids)
+                mac_tm_train = proto2tm[proto_id_train][ind_id_train]
+
+                # Get reference embedding for reward shaping
+                z_ref = prototype_manager.get_reference_embedding(proto_id_train)
+            else:
+                # Original: flat population selection
+                proto_id_train = 0
+                ind_id_train = np.random.randint(len(proto2tm[proto_id_train]))
+                mac_tm_train = proto2tm[proto_id_train][ind_id_train]
+                z_ref = None
+
+            ## Collect SP trajectory
+            episode_batch_sp = runner.run(
+                mac1=mac_tm_train, mac2=None,
+                test_mode=False, test_mode_1=False, test_mode_2=False,
+                tm_id=ind_id_train, proto_id=proto_id_train if use_style_aware else None,
+                eps_greedy_t=runner.t_env-t_env_start
+            )
+
+            ## Add reward shaping (style control + exploration)
+            reward_shaping_info = {}
+            if use_style_aware and z_ref is not None:
+                alpha_ref = getattr(args, 'alpha_style_control', 1.0)
+                alpha_explore = getattr(args, 'alpha_exploration', 0.1)
+                episode_batch_sp, r_ref_mean, r_explore_mean = add_shaped_rewards_to_batch(
+                    episode_batch_sp, style_encoder, prototype_manager, proto_id_train,
+                    z_ref, alpha_ref=alpha_ref, alpha_explore=alpha_explore, device=args.device
+                )
+                reward_shaping_info['sp_r_ref'] = r_ref_mean
+                reward_shaping_info['sp_r_explore'] = r_explore_mean
+
+            tm2buffer[proto_id_train][ind_id_train].insert_episode_batch(episode_batch_sp)
+
+            ## Collect XP trajectory
             if args.xp_coef > 0 and iter > 0:
                 if len(all_head_id_list) == 0 or np.random.uniform(0, 1) < 0.5:
                     sample_head_id = None
                 else:
-                    sample_head_id = np.random.choice(all_head_id_list) # past head id
-                episode_batch = runner.run(mac1=mac_ego, mac2=tm2mac[tm_id_train], test_mode=False, test_mode_1=True, test_mode_2=False, negative_reward=True, tm_id=tm_id_train, eps_greedy_t=runner.t_env-t_env_start, iter=iter, head_id=sample_head_id)
-                tm2bufferxp[tm_id_train].insert_episode_batch(episode_batch)
+                    sample_head_id = np.random.choice(all_head_id_list)
 
-            ## call learner and train the tm network
-            if tm2buffer[tm_id_train].can_sample(args.batch_size):
-                sp_batch = tm2buffer[tm_id_train].sample(args.batch_size)
+                episode_batch_xp = runner.run(
+                    mac1=mac_ego, mac2=mac_tm_train,
+                    test_mode=False, test_mode_1=True, test_mode_2=False,
+                    negative_reward=True, tm_id=ind_id_train, proto_id=proto_id_train,
+                    eps_greedy_t=runner.t_env-t_env_start, iter=iter, head_id=sample_head_id
+                )
+
+                ## Add reward shaping to XP trajectory too
+                if use_style_aware and z_ref is not None:
+                    episode_batch_xp, xp_r_ref_mean, xp_r_explore_mean = add_shaped_rewards_to_batch(
+                        episode_batch_xp, style_encoder, prototype_manager, proto_id_train,
+                        z_ref, alpha_ref=alpha_ref, alpha_explore=alpha_explore, device=args.device
+                    )
+                    reward_shaping_info['xp_r_ref'] = xp_r_ref_mean
+                    reward_shaping_info['xp_r_explore'] = xp_r_explore_mean
+
+                tm2bufferxp[proto_id_train][ind_id_train].insert_episode_batch(episode_batch_xp)
+
+            ## Train the teammate network
+            if tm2buffer[proto_id_train][ind_id_train].can_sample(args.batch_size):
+                sp_batch = tm2buffer[proto_id_train][ind_id_train].sample(args.batch_size)
                 max_ep_t = sp_batch.max_t_filled()
                 sp_batch = sp_batch[:, :max_ep_t]
                 if sp_batch.device != args.device:
                     sp_batch.to(args.device)
+
                 xp_batch = None
-                if args.xp_coef > 0 and tm2bufferxp[tm_id_train].can_sample(args.batch_size) and iter > 0:
-                    xp_batch = tm2bufferxp[tm_id_train].sample(args.batch_size)
+                if args.xp_coef > 0 and tm2bufferxp[proto_id_train][ind_id_train].can_sample(args.batch_size) and iter > 0:
+                    xp_batch = tm2bufferxp[proto_id_train][ind_id_train].sample(args.batch_size)
                     max_ep_t = xp_batch.max_t_filled()
                     xp_batch = xp_batch[:, :max_ep_t]
                     if xp_batch.device != args.device:
                         xp_batch.to(args.device)
-                tm2learner[tm_id_train].train(sp_batch, xp_batch, runner.t_env, episode, tm2mac)
+
+                # Get all macs in this prototype for diversity loss
+                all_macs_in_proto = {i: proto2tm[proto_id_train][i] for i in proto2tm[proto_id_train].keys()}
+                tm2learner[proto_id_train][ind_id_train].train(
+                    sp_batch, xp_batch, runner.t_env, episode, all_macs_in_proto,
+                    reward_shaping_info=reward_shaping_info if use_style_aware else None
+                )
+
+            ## Update reference policy periodically
+            if use_style_aware and (episode % 50 == 0):  # Every 50 episodes
+                # Quick evaluation using few_shot mode to get run_info
+                test_returns = []
+                for _ in range(3):
+                    run_info = runner.run(
+                        mac1=mac_tm_train, mac2=None, test_mode=True,
+                        test_mode_1=True, test_mode_2=True, tm_id=ind_id_train, proto_id=proto_id_train, few_shot=True
+                    )
+                    test_returns.append(run_info["episode_return"])
+
+                avg_return = np.mean(test_returns)
+
+                # Reset test statistics to avoid accumulation issues
+                runner.test_returns = []
+                runner.test_stats = {}
+
+                # Compute trajectory embedding - use train mode to ensure we get batch
+                test_batch_full = runner.run(
+                    mac1=mac_tm_train, mac2=None, test_mode=False,  # Use train mode
+                    test_mode_1=True, test_mode_2=True, tm_id=ind_id_train, proto_id=proto_id_train
+                )
+
+                # Check we got a batch, not a scalar
+                if not isinstance(test_batch_full, (int, float)):
+                    z_tau = compute_trajectory_style_embedding(test_batch_full, style_encoder, args.device)
+
+                    # Update reference if better
+                    prototype_manager.update_reference_policy(proto_id_train, mac_tm_train, avg_return, z_tau)
+                    prototype_manager.record_performance(proto_id_train, avg_return)
+
+                # Clean up statistics
+                runner.test_returns = []
+                runner.test_stats = {}
+                runner.train_returns = []
+                runner.train_stats = {}
 
             ## testing
             if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
@@ -200,9 +496,11 @@ def run_sequential(args, logger):
                 last_time = time.time()
                 last_test_T = runner.t_env
                 for test_tm, test_mac in tm2mac.items():
+                    test_proto_id, test_ind_id = tm_idx_to_proto_info[test_tm]
                     for _ in range(args.test_nepisode): # tm sp
-                        runner.run(mac1=test_mac, mac2=None,     test_mode=True, test_mode_1=True, test_mode_2=True, tm_id=test_tm)
-                    evaluate_xp_log(args, test_tm, iter, iter_plus_tm_2_head_id, all_head_id_list, runner, mac_ego, test_mac)
+                        runner.run(mac1=test_mac, mac2=None, test_mode=True, test_mode_1=True, test_mode_2=True,
+                                   tm_id=test_ind_id, proto_id=test_proto_id if use_style_aware else None)
+                    evaluate_xp_log(args, test_tm, test_proto_id, test_ind_id, iter, iter_plus_tm_2_head_id, all_head_id_list, runner, mac_ego, test_mac, use_style_aware)
 
             ## logging
             episode += args.batch_size_run
@@ -221,18 +519,21 @@ def run_sequential(args, logger):
                     save_mac.save_models(save_path)
 
         ## clear the tm buffers
-        for tm_id_train in range(args.n_population):
-            tm2buffer[tm_id_train]   = deepcopy(empty_buffer)
-            tm2bufferxp[tm_id_train] = deepcopy(empty_buffer)
+        for proto_id in tm2buffer.keys():
+            for ind_id in tm2buffer[proto_id].keys():
+                tm2buffer[proto_id][ind_id] = deepcopy(empty_buffer)
+                tm2bufferxp[proto_id][ind_id] = deepcopy(empty_buffer)
 
         ## final testing
         for test_tm, test_mac in tm2mac.items():
+            test_proto_id, test_ind_id = tm_idx_to_proto_info[test_tm]
             for _ in range(args.test_nepisode): # tm sp
-                runner.run(mac1=test_mac, mac2=None,     test_mode=True, test_mode_1=True, test_mode_2=True, tm_id=test_tm)
-            evaluate_xp_log(args, test_tm, iter, iter_plus_tm_2_head_id, all_head_id_list, runner, mac_ego, test_mac)
+                runner.run(mac1=test_mac, mac2=None, test_mode=True, test_mode_1=True, test_mode_2=True,
+                           tm_id=test_ind_id, proto_id=test_proto_id if use_style_aware else None)
+            evaluate_xp_log(args, test_tm, test_proto_id, test_ind_id, iter, iter_plus_tm_2_head_id, all_head_id_list, runner, mac_ego, test_mac, use_style_aware)
 
-        ## population selection
-        if iter > 0:
+        ## Adaptive Prototype Management (Style-Aware) or Population Selection (Original)
+        if use_style_aware and iter > 0:
             # select the tm that can sp well
             can_sp_tm2sp_ret = {}
             for id_test_stop, mac_test_stop in enumerate(list(parents.values()) + list(tm2mac.values())):
@@ -321,20 +622,26 @@ def run_sequential(args, logger):
         logger.console_logger.info("Beginning training ego for {} timesteps".format(args.t_train_ego))
 
         for tm_id_train_ego, mac_tm_train_ego in tm2mac.items():
-            
+            # Get prototype info for this teammate
+            ego_train_proto_id, ego_train_ind_id = tm_idx_to_proto_info[tm_id_train_ego]
+
             ## create a new head
             if iter==0 and tm_id_train_ego==0:
                 pass
             else:
                 mac_ego.agent.reset_head()
-            
+
             ## start training
             t_env_start = runner.t_env
             ego_train_steps = args.t_train_ego // args.n_population
             while runner.t_env - t_env_start <= ego_train_steps:
 
                 ## collect xp traj and learn
-                episode_batch = runner.run(mac1=mac_ego, mac2=mac_tm_train_ego, test_mode=False, test_mode_1=False, test_mode_2=True, tm_id=tm_id_train_ego, eps_greedy_t=runner.t_env-t_env_start, iter=iter)
+                episode_batch = runner.run(
+                    mac1=mac_ego, mac2=mac_tm_train_ego, test_mode=False, test_mode_1=False, test_mode_2=True,
+                    tm_id=ego_train_ind_id, proto_id=ego_train_proto_id if use_style_aware else None,
+                    eps_greedy_t=runner.t_env-t_env_start, iter=iter
+                )
                 buffer_ego.insert_episode_batch(episode_batch)
                 if buffer_ego.can_sample(args.batch_size):
                     episode_sample = buffer_ego.sample(args.batch_size)
@@ -342,7 +649,10 @@ def run_sequential(args, logger):
                     episode_sample = episode_sample[:, :max_ep_t]
                     if episode_sample.device != args.device:
                         episode_sample.to(args.device)
-                    learner_ego.train(episode_sample, runner.t_env, episode)
+                    learner_ego.train(
+                        episode_sample, runner.t_env, episode,
+                        head_id=tm_id_train_ego, proto_id=ego_train_proto_id if use_style_aware else None
+                    )
 
                 ## testing
                 if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
@@ -353,7 +663,8 @@ def run_sequential(args, logger):
                     last_test_T = runner.t_env
                     for iter_, tm2mac_ in iter2tm2mac4testing.items():
                         for tm_, mac_ in tm2mac_.items():
-                            evaluate_xp_log(args, tm_, iter_, iter_plus_tm_2_head_id, all_head_id_list, runner, mac_ego, mac_)
+                            proto_id_, ind_id_ = tm_idx_to_proto_info[tm_]
+                            evaluate_xp_log(args, tm_, proto_id_, ind_id_, iter_, iter_plus_tm_2_head_id, all_head_id_list, runner, mac_ego, mac_, use_style_aware)
 
                 ## logging
                 episode += args.batch_size_run
@@ -377,7 +688,8 @@ def run_sequential(args, logger):
             ## final testing
             for iter_, tm2mac_ in iter2tm2mac4testing.items():
                 for tm_, mac_ in tm2mac_.items():
-                    evaluate_xp_log(args, tm_, iter_, iter_plus_tm_2_head_id, all_head_id_list, runner, mac_ego, mac_)
+                    proto_id_, ind_id_ = tm_idx_to_proto_info[tm_]
+                    evaluate_xp_log(args, tm_, proto_id_, ind_id_, iter_, iter_plus_tm_2_head_id, all_head_id_list, runner, mac_ego, mac_, use_style_aware)
 
             ## head expansion mechanism, decide if the new trained head should be saved
             tm2head_id = get_head_id(args, tm_id_train_ego, iter, iter_plus_tm_2_head_id)
