@@ -179,11 +179,10 @@ class QLearnerTM:
             self._update_targets_soft(self.args.target_update_interval_or_tau)
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
-            # Create log prefix based on whether using style-aware mode
-            if self.proto_id is not None:
-                log_prefix = f"proto_{self.proto_id}_ind_{self.tm_index}"
-            else:
-                log_prefix = f"tm_{self.tm_index}"
+            # Create log prefix with prototype information
+            # For backward compatibility: if proto_id is None, default to 0
+            effective_proto_id = self.proto_id if self.proto_id is not None else 0
+            log_prefix = f"proto_{effective_proto_id}_ind_{self.tm_index}"
 
             # Log main losses
             self.logger.log_stat(f"loss_{log_prefix}", loss.item(), t_env)
