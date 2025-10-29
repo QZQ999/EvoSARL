@@ -435,27 +435,40 @@ def run_sequential(args, logger):
 
             ## Update reference policy periodically
             if use_style_aware and (episode % 50 == 0):  # Every 50 episodes
-                # Quick evaluation
+                # Quick evaluation using few_shot mode to get run_info
                 test_returns = []
                 for _ in range(3):
-                    test_batch = runner.run(
+                    run_info = runner.run(
                         mac1=mac_tm_train, mac2=None, test_mode=True,
                         test_mode_1=True, test_mode_2=True, tm_id=ind_id_train, few_shot=True
                     )
-                    test_returns.append(test_batch["episode_return"])
+                    test_returns.append(run_info["episode_return"])
 
                 avg_return = np.mean(test_returns)
 
-                # Compute trajectory embedding
+                # Reset test statistics to avoid accumulation issues
+                runner.test_returns = []
+                runner.test_stats = {}
+
+                # Compute trajectory embedding - use train mode to ensure we get batch
                 test_batch_full = runner.run(
-                    mac1=mac_tm_train, mac2=None, test_mode=True,
+                    mac1=mac_tm_train, mac2=None, test_mode=False,  # Use train mode
                     test_mode_1=True, test_mode_2=True, tm_id=ind_id_train
                 )
-                z_tau = compute_trajectory_style_embedding(test_batch_full, style_encoder, args.device)
 
-                # Update reference if better
-                prototype_manager.update_reference_policy(proto_id_train, mac_tm_train, avg_return, z_tau)
-                prototype_manager.record_performance(proto_id_train, avg_return)
+                # Check we got a batch, not a scalar
+                if not isinstance(test_batch_full, (int, float)):
+                    z_tau = compute_trajectory_style_embedding(test_batch_full, style_encoder, args.device)
+
+                    # Update reference if better
+                    prototype_manager.update_reference_policy(proto_id_train, mac_tm_train, avg_return, z_tau)
+                    prototype_manager.record_performance(proto_id_train, avg_return)
+
+                # Clean up statistics
+                runner.test_returns = []
+                runner.test_stats = {}
+                runner.train_returns = []
+                runner.train_stats = {}
 
             ## testing
             if (runner.t_env - last_test_T) / args.test_interval >= 1.0:

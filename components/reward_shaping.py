@@ -182,26 +182,37 @@ def collect_trajectories_for_embedding_training(runner, mac_list, n_episodes=10)
     trajectories = []
 
     for mac in mac_list:
-        for _ in range(n_episodes):
-            # Run episode in self-play mode
+        for ep_idx in range(n_episodes):
+            # Use train mode to avoid test stats accumulation that triggers early return
+            # test_mode=True would accumulate test_returns and return mean after test_nepisode
             episode_batch = runner.run(
                 mac1=mac,
                 mac2=None,  # Self-play
-                test_mode=True,  # Greedy
-                test_mode_1=True,
-                test_mode_2=True,
+                test_mode=False,  # Use train mode to avoid test episode counter
+                test_mode_1=True,  # But still use greedy action selection for mac1
+                test_mode_2=True,  # And greedy for mac2 (None in this case)
                 tm_id=-1
             )
 
-            # Extract states and actions
-            obs = episode_batch["obs"][:, :-1]  # (1, seq_len, n_agents, obs_dim)
-            actions_onehot = episode_batch["actions_onehot"][:, :-1]  # (1, seq_len, n_agents, n_actions)
+            # Check if we got a batch (not a scalar from test mode averaging)
+            if not isinstance(episode_batch, (int, float)):
+                # Extract states and actions
+                obs = episode_batch["obs"][:, :-1]  # (1, seq_len, n_agents, obs_dim)
+                actions_onehot = episode_batch["actions_onehot"][:, :-1]  # (1, seq_len, n_agents, n_actions)
 
-            # Squeeze batch dimension and average over agents
-            obs = obs.squeeze(0).mean(dim=1).cpu().numpy()  # (seq_len, obs_dim)
-            actions = actions_onehot.squeeze(0).mean(dim=1).cpu().numpy()  # (seq_len, n_actions)
+                # Squeeze batch dimension and average over agents
+                obs = obs.squeeze(0).mean(dim=1).cpu().numpy()  # (seq_len, obs_dim)
+                actions = actions_onehot.squeeze(0).mean(dim=1).cpu().numpy()  # (seq_len, n_actions)
 
-            trajectories.append((obs, actions))
+                trajectories.append((obs, actions))
+
+        # Reset statistics after each MAC to keep runner clean
+        if hasattr(runner, 'test_returns'):
+            runner.test_returns = []
+            runner.test_stats = {}
+        if hasattr(runner, 'train_returns'):
+            runner.train_returns = []
+            runner.train_stats = {}
 
     return trajectories
 
