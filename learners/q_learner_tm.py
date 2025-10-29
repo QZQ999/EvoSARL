@@ -10,11 +10,12 @@ from components.standarize_stream import RunningMeanStd
 
 
 class QLearnerTM:
-    def __init__(self, mac, scheme, logger, args, tm_index):
+    def __init__(self, mac, scheme, logger, args, tm_index, proto_id=None):
         self.args = args
         self.mac = mac
         self.logger = logger
-        self.tm_index = tm_index
+        self.tm_index = tm_index  # Individual ID
+        self.proto_id = proto_id  # Prototype ID (None for non-style-aware mode)
 
         self.params = list(mac.parameters())
 
@@ -149,10 +150,16 @@ class QLearnerTM:
         log_info["target_mean"] = (targets * mask).sum().item()/(mask_elems * self.args.n_agents)
         return td_loss, div_loss, log_info
 
-    def train(self, sp_batch: EpisodeBatch, xp_batch: EpisodeBatch, t_env: int, episode_num: int, tm2mac):
+    def train(self, sp_batch: EpisodeBatch, xp_batch: EpisodeBatch, t_env: int, episode_num: int, tm2mac, reward_shaping_info=None):
+        """
+        Train the teammate agent.
+
+        Args:
+            reward_shaping_info: Dict with keys 'sp_r_ref', 'sp_r_explore', 'xp_r_ref', 'xp_r_explore' (optional)
+        """
         xp_td_loss = th.tensor(0)
         sp_td_loss, diveristy_loss, sp_log_info = self.get_loss(sp_batch, type="sp", get_diversity=True, tm2mac=tm2mac)
-           
+
         xp_log_info = {}
         if self.args.xp_coef > 0 and xp_batch is not None:
             xp_td_loss, _, xp_log_info = self.get_loss(xp_batch, type="xp")
@@ -172,15 +179,36 @@ class QLearnerTM:
             self._update_targets_soft(self.args.target_update_interval_or_tau)
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
-            self.logger.log_stat(f"loss_{self.tm_index}", loss.item(), t_env)
-            self.logger.log_stat(f"sp_loss_{self.tm_index}", sp_td_loss.item(), t_env)
-            self.logger.log_stat(f"div_loss_{self.tm_index}", diveristy_loss.item(), t_env)
-            self.logger.log_stat(f"xp_loss_{self.tm_index}", xp_td_loss.item(), t_env)
-            self.logger.log_stat(f"grad_norm_{self.tm_index}", grad_norm, t_env)
+            # Create log prefix based on whether using style-aware mode
+            if self.proto_id is not None:
+                log_prefix = f"proto_{self.proto_id}_ind_{self.tm_index}"
+            else:
+                log_prefix = f"tm_{self.tm_index}"
+
+            # Log main losses
+            self.logger.log_stat(f"loss_{log_prefix}", loss.item(), t_env)
+            self.logger.log_stat(f"sp_loss_{log_prefix}", sp_td_loss.item(), t_env)
+            self.logger.log_stat(f"div_loss_{log_prefix}", diveristy_loss.item(), t_env)
+            self.logger.log_stat(f"xp_loss_{log_prefix}", xp_td_loss.item(), t_env)
+            self.logger.log_stat(f"grad_norm_{log_prefix}", grad_norm, t_env)
+
+            # Log Q-values and TD errors
             for sp_elem_key in sp_log_info:
-                self.logger.log_stat("sp_"+sp_elem_key+f"_{self.tm_index}", sp_log_info[sp_elem_key], t_env)
+                self.logger.log_stat(f"sp_{sp_elem_key}_{log_prefix}", sp_log_info[sp_elem_key], t_env)
             for xp_elem_key in xp_log_info:
-                self.logger.log_stat("xp_"+xp_elem_key+f"_{self.tm_index}", xp_log_info[xp_elem_key], t_env)
+                self.logger.log_stat(f"xp_{xp_elem_key}_{log_prefix}", xp_log_info[xp_elem_key], t_env)
+
+            # Log reward shaping information (style-aware specific)
+            if reward_shaping_info is not None:
+                if 'sp_r_ref' in reward_shaping_info:
+                    self.logger.log_stat(f"sp_r_ref_{log_prefix}", reward_shaping_info['sp_r_ref'], t_env)
+                if 'sp_r_explore' in reward_shaping_info:
+                    self.logger.log_stat(f"sp_r_explore_{log_prefix}", reward_shaping_info['sp_r_explore'], t_env)
+                if 'xp_r_ref' in reward_shaping_info:
+                    self.logger.log_stat(f"xp_r_ref_{log_prefix}", reward_shaping_info['xp_r_ref'], t_env)
+                if 'xp_r_explore' in reward_shaping_info:
+                    self.logger.log_stat(f"xp_r_explore_{log_prefix}", reward_shaping_info['xp_r_explore'], t_env)
+
             self.log_stats_t = t_env
 
     def _update_targets_hard(self):

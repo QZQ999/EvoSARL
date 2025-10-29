@@ -64,7 +64,14 @@ class QLearnerEgo:
                 loss[head_id] += ((p - target_param[n]) ** 2).sum()
         return loss
     
-    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, head_id=None, proto_id=None):
+        """
+        Train the ego agent.
+
+        Args:
+            head_id: Head ID for multi-head architecture (optional)
+            proto_id: Prototype ID when training against specific prototype teammates (optional)
+        """
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -152,13 +159,26 @@ class QLearnerEgo:
             self._update_targets_soft(self.args.target_update_interval_or_tau)
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
-            self.logger.log_stat("loss", loss.item(), t_env)
-            self.logger.log_stat("grad_norm", grad_norm, t_env)
+            # Create log prefix based on head_id or proto_id
+            if head_id is not None:
+                log_prefix = f"ego_head_{head_id}"
+            elif proto_id is not None:
+                log_prefix = f"ego_proto_{proto_id}"
+            else:
+                log_prefix = "ego"
+
+            # Log losses
+            self.logger.log_stat(f"{log_prefix}_loss", loss.item(), t_env)
+            self.logger.log_stat(f"{log_prefix}_td_loss", td_loss.item(), t_env)
+            self.logger.log_stat(f"{log_prefix}_reg_loss", reg_loss.item(), t_env)
+            self.logger.log_stat(f"{log_prefix}_grad_norm", grad_norm, t_env)
+
+            # Log Q-values and TD errors
             mask_elems = mask.sum().item()
-            self.logger.log_stat("td_error_abs", (masked_td_error.abs().sum().item()/mask_elems), t_env)
-            self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_ego), t_env)
-            self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_ego), t_env)
-            self.logger.log_stat("forget_loss", reg_loss.item(), t_env)
+            self.logger.log_stat(f"{log_prefix}_td_error_abs", (masked_td_error.abs().sum().item()/mask_elems), t_env)
+            self.logger.log_stat(f"{log_prefix}_q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_ego), t_env)
+            self.logger.log_stat(f"{log_prefix}_target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_ego), t_env)
+
             self.log_stats_t = t_env
 
     def _update_targets_hard(self):
